@@ -6,6 +6,7 @@
 #include <liboptions/liboptions.h>
 #include <libmints/mints.h>
 #include <libpsio/psio.hpp>
+#include <libpsio/psio.h>
 #include <libciomr/libciomr.h>
 #include <libdpd/dpd.h>
 #include <libdpd/dpd.gbl>
@@ -19,7 +20,9 @@ namespace psi{ namespace dpd_unit_test {
 
 int **cacheprep_rhf(int level, int *cachefiles);
 void cachedone_rhf(int **cachelist);
-double dpd_rand(void);
+double dpd_rand(int places);
+void dpd_buf4_fill(dpdbuf4 *);
+bool dpd_buf4_compare(dpdbuf4 *X, dpdbuf4 *Y, double cutoff);
 
 extern "C" 
 int read_options(std::string name, Options& options)
@@ -36,6 +39,9 @@ extern "C"
 PsiReturnType psi4_libdpd_unit_test(Options& options)
 {
     int print = options.get_int("PRINT");
+    boost::shared_ptr<PSIO> psio(new PSIO);
+
+    for(int i =PSIF_CC_MIN; i <= PSIF_CC_MAX; i++) psio_open(i,1);
 
     // Set up lots of look-ups needed for DPD functionality
     int **cachelist, *cachefiles;
@@ -63,20 +69,65 @@ PsiReturnType psi4_libdpd_unit_test(Options& options)
       offset += virtpi[h];
     }
 
+    // See random-number generator
+    srand(time(0));
+
     // Initialize the library
     dpd_init(0, nirreps, 256000000, 0, cachefiles, cachelist, NULL, 2, 
              occpi, occsym, virtpi, virsym);
 
-    dpdbuf4 X;
-    dpd_buf4_init(&X, PSIF_CC_TMP0, 0, 0, 5, 0, 5, 0, "X(ij,ab)");
-    dpd_buf4_print(&X, outfile, 0);
+    // Testing dpd_contract444() out-of-core algorithm #2
+    //  alpha * X(ab,ij) * Y(ij,cd) --> Z(ab,cd) + beta * Z(ab,cd)
+    dpdbuf4 X, Y, Z;
+    dpd_buf4_init(&X, PSIF_CC_TMP0, 0, 5, 0, 5, 0, 0, "X(ab,ij)");
+    dpd_buf4_fill(&X);
     dpd_buf4_close(&X);
 
-    // Test random-number generation
-    srand(time(0));
-    for(int j=0; j < 30; j++) {
-      fprintf(outfile, "d = %20.12f\n", dpd_rand());
-    }
+    dpd_buf4_init(&Y, PSIF_CC_TMP0, 0, 0, 5, 0, 5, 0, "Y(ij,ab)");
+    dpd_buf4_fill(&Y);
+    dpd_buf4_close(&Y);
+
+    // Run in core
+    dpd_buf4_init(&Z, PSIF_CC_TMP0, 0, 5, 5, 5, 5, 0, "Z(ab,cd)");
+    dpd_buf4_init(&Y, PSIF_CC_TMP0, 0, 0, 5, 0, 5, 0, "Y(ij,ab)");
+    dpd_buf4_init(&X, PSIF_CC_TMP0, 0, 5, 0, 5, 0, 0, "X(ab,ij)");
+    dpd_contract444(&X, &Y, &Z, 0, 1, 2, 0);
+    dpd_buf4_close(&X);
+    dpd_buf4_close(&Y);
+    dpd_buf4_close(&Z);
+
+    // Force out-of-core
+    dpd_memset(750000);
+    dpd_buf4_init(&Z, PSIF_CC_TMP0, 0, 5, 5, 5, 5, 0, "Z(ab,cd) ooc");
+    dpd_buf4_init(&Y, PSIF_CC_TMP0, 0, 0, 5, 0, 5, 0, "Y(ij,ab)");
+    dpd_buf4_init(&X, PSIF_CC_TMP0, 0, 5, 0, 5, 0, 0, "X(ab,ij)");
+    dpd_contract444(&X, &Y, &Z, 0, 1, 2, 0);
+    dpd_buf4_close(&X);
+    dpd_buf4_close(&Z);
+    dpd_memset(256000000);
+
+    // Compare results
+    dpdbuf4 Z1, Z2;
+    dpd_buf4_init(&Z1, PSIF_CC_TMP0, 0, 5, 5, 5, 5, 0, "Z(ab,cd)");
+    dpd_buf4_init(&Z2, PSIF_CC_TMP0, 0, 5, 5, 5, 5, 0, "Z(ab,cd) ooc");
+    if(!dpd_buf4_compare(&Z1, &Z2, 1e-6))
+      fprintf(outfile, "\nResulting Z(ab,cd) matrices do not match from contract444.\n");
+    else
+      fprintf(outfile, "\nResulting Z(ab,cd) matrices from contract444 match!\n");
+    dpd_buf4_close(&Z1);
+    dpd_buf4_close(&Z2);
+
+
+    // Testing out-of-core psrq sort
+    dpd_buf4_init(&X, PSIF_CC_TMP0, 0, 5, 0, 5, 0, 0, "X(ab,ij)");
+    dpd_buf4_fill(&X);
+    // In-core
+    dpd_buf4_sort(&X, PSIF_CC_TMP0, psrq, 11, 10, "X(aj,ib)");
+
+    // Out-of-core
+    dpd_memset(750000);
+    dpd_buf4_sort(&X, PSIF_CC_TMP0, psrq, 11, 10, "X(aj,ib)");
+    dpd_memset(256000000);
 
     // Shut down the library
     dpd_close(0);
@@ -86,14 +137,49 @@ PsiReturnType psi4_libdpd_unit_test(Options& options)
     delete [] occsym;
     delete [] virsym;
 
+    for(int i=PSIF_CC_TMP; i <= PSIF_CC_TMP11; i++) psio_close(i,0);
+
     return Success;
 }
 
-double dpd_rand()  // must pre-seed
+// Generate random numbers (seed in caller)
+double dpd_rand(int places)  // arg = # decimal places
 {
-  long prec = (long) pow(10.0,7.0);
+  long prec = (long) pow(10.0,(double) places); 
   double i = ((long) rand()) % (40l*prec) - (20l*prec);
   return i / (100l*prec);
+}
+
+// Fill a given DPD buffer with random numbers (seed in caller)
+void dpd_buf4_fill(dpdbuf4 *X)
+{
+  for(int h=0; h < X->params->nirreps; h++) {
+    dpd_buf4_mat_irrep_init(X, h);
+    for(int p=0; p < X->params->rowtot[h]; p++)
+      for(int q=0; q < X->params->coltot[h]; q++)
+        X->matrix[h][p][q] = dpd_rand(7);
+    dpd_buf4_mat_irrep_wrt(X, h);
+    dpd_buf4_mat_irrep_close(X, h);
+  }
+}
+
+// Compare two buffers element-by-element to within the specified cutoff
+bool dpd_buf4_compare(dpdbuf4 *X, dpdbuf4 *Y, double cutoff)
+{
+  bool match = true;
+
+  for(int h=0; h < X->params->nirreps; h++) {
+    dpd_buf4_mat_irrep_init(X, h);
+    dpd_buf4_mat_irrep_rd(X, h);
+    dpd_buf4_mat_irrep_init(Y, h);
+    dpd_buf4_mat_irrep_rd(Y, h);
+    for(int p=0; p < X->params->rowtot[h]; p++)
+      for(int q=0; q < X->params->coltot[h]; q++)
+        if(fabs(X->matrix[h][p][q] - Y->matrix[h][p][q]) > cutoff) match = false;
+    dpd_buf4_mat_irrep_close(X, h);
+    dpd_buf4_mat_irrep_close(Y, h);
+  }
+  return match;
 }
 
 }} // End namespaces
