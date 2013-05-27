@@ -2,7 +2,7 @@
 # PYTHONPATH must include directory above plugin directory.
 #     Define either externally or here, then import plugin.
 sys.path.insert(0, './..')
-import dpd_unit_test
+import psi4_libdpd_unit_test
 
 molecule {
 O
@@ -21,5 +21,5 @@ set dpd_unit_test {
   print 1
 }
 
-plugin("./dpd_unit_test.so")
+plugin("./psi4_libdpd_unit_test.so")
 
